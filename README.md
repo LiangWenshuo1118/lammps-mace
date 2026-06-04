@@ -7,8 +7,6 @@ running MD again with a fine-tuned model.
 
 Chinese documentation is available in [README_zh.md](README_zh.md).
 
-Repository: [https://github.com/LiangWenshuo1118/lammps-mace](https://github.com/LiangWenshuo1118/lammps-mace)
-
 After installation, the command is:
 
 ```bash
