@@ -1,0 +1,774 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{needspace}
+
+\setmainfont{Helvetica Neue}
+\setsansfont{Helvetica Neue}
+\setmonofont{Menlo}
+\setCJKmainfont{Songti SC}
+\setCJKsansfont{PingFang SC}
+\setCJKmonofont{PingFang SC}
+
+\definecolor{lmblue}{HTML}{1F5F8B}
+\definecolor{lmgray}{HTML}{F4F6F8}
+\definecolor{lmborder}{HTML}{D7DEE8}
+\definecolor{lmcode}{HTML}{253041}
+\definecolor{lmgreen}{HTML}{1B7F5A}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=lmblue,
+  urlcolor=lmblue,
+  citecolor=lmblue,
+  pdftitle={lammps-mace 使用教程},
+  pdfauthor={lammps-mace contributors}
+}
+
+\lstdefinestyle{shell}{
+  basicstyle=\ttfamily\small\color{lmcode},
+  backgroundcolor=\color{lmgray},
+  frame=single,
+  rulecolor=\color{lmborder},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=0.5em,
+  xrightmargin=0.5em,
+  aboveskip=0.8em,
+  belowskip=0.8em
+}
+\lstset{style=shell}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textsf{lammps-mace 使用教程}}
+\rhead{\textsf{\thepage/\pageref{LastPage}}}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\setlist[itemize]{leftmargin=1.8em}
+\setlist[enumerate]{leftmargin=2em}
+\setlength{\parindent}{0pt}
+\renewcommand{\arraystretch}{1.25}
+
+\title{\Huge\textsf{基于lammps-mace 程序包的熔盐分子模拟}\\[0.6em]
+\large 从熔盐体系建模到MACE模型微调和LAMMPS 分子模拟}
+\author{Wenshuo Liang}
+\date{2026-06-03}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{center}
+\fcolorbox{lmborder}{lmgray}{
+  \begin{minipage}{0.9\linewidth}
+本文档面向已经具备 Python、Packmol、LAMMPS 和 MACE 基础运行环境的用户，说明如何使用 \texttt{lammps-mace} 包完成高通量熔盐体系的构盒、零样本 MACE-MD 输入生成、MACE 微调任务准备，以及微调模型 MD 输入生成。本文档是打印版教程，命令可直接复制到终端后按实际路径调整。
+  \end{minipage}
+}
+\end{center}
+
+\vspace{1em}
+\tableofcontents
+\newpage
+
+\section{工作流概览}
+
+\texttt{lammps-mace} 是一个围绕 MACE-MP、LAMMPS ML-IAP 和熔盐体系建模整理的命令行包。它的目标不是替代 LAMMPS、MACE 或 DFT 软件，而是把重复性强、容易写错路径的步骤收敛到一个稳定的 CLI。
+
+\subsection{核心阶段}
+
+推荐把一次完整流程拆成下面五个阶段：
+
+\begin{enumerate}
+  \item 准备工作目录和 CSV 体系表。
+  \item 用 Packmol 和 ASE 从 CSV 批量构建 \texttt{simulation\_box/box.data}。
+  \item 基于基础 MACE-MP ML-IAP 模型生成零样本 LAMMPS 输入。
+  \item 用 extxyz 数据准备 MACE 微调任务目录和训练脚本。
+  \item 将微调后的 \texttt{.model} 转换为 ML-IAP \texttt{.pt}，再生成微调模型的 LAMMPS 输入。
+\end{enumerate}
+
+\subsection{目录约定}
+
+软件安装、源码和任务数据建议分开管理。远端机器上推荐如下布局：
+
+\begin{lstlisting}
+/root/base/envs/mace-lammps-torch291-cu128
+/root/base/src/lammps-mace
+/root/base/src/lammps-develop
+/root/base/build/lammps-mliap-torch291-cu128
+/root/base/software/lammps-mliap-torch291-cu128
+/root/shared-nvme/mace_lammps_smoke/outputs
+\end{lstlisting}
+
+\texttt{/root/base} 适合放 conda/venv、源码、编译目录和软件前缀。\texttt{/root/shared-nvme} 是共享卷，适合放任务、数据、模型和输出，不建议作为软件安装前缀。
+
+\section{安装与环境检查}
+
+\subsection{安装依赖并启动环境}
+
+远端环境使用 conda prefix。应先加载 conda shell hook，再激活目标 prefix：
+
+\begin{lstlisting}[language=bash]
+source /base/mambaforge/etc/profile.d/conda.sh
+conda activate /root/base/envs/mace-lammps-torch291-cu128
+\end{lstlisting}
+
+如果环境还不存在，先创建并安装构盒阶段的基础依赖：
+
+\begin{lstlisting}[language=bash]
+mkdir -p /root/base/envs
+/base/mambaforge/bin/conda create -y \
+  -p /root/base/envs/mace-lammps-torch291-cu128 \
+  -c conda-forge \
+  python=3.12 cmake ninja openmpi packmol
+
+source /base/mambaforge/etc/profile.d/conda.sh
+conda activate /root/base/envs/mace-lammps-torch291-cu128
+\end{lstlisting}
+
+随后安装 Python 侧依赖。普通 PyPI 包和 PyTorch/CUDA wheel 建议分开装：
+
+\begin{lstlisting}[language=bash]
+PY=/root/base/envs/mace-lammps-torch291-cu128/bin/python
+
+$PY -m pip install \
+  -i https://mirrors.aliyun.com/pypi/simple/ \
+  --trusted-host mirrors.aliyun.com \
+  --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  filelock typing-extensions sympy networkx jinja2 fsspec pillow \
+  numpy==1.26.4 mpmath MarkupSafe
+
+$PY -m pip install --no-deps \
+  --index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cu128 \
+  torch==2.9.1+cu128 torchvision==0.24.1+cu128 torchaudio==2.9.1+cu128
+
+$PY -m pip install --no-deps \
+  --index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cu128 \
+  nvidia-cuda-nvrtc-cu12==12.8.93 \
+  nvidia-cuda-runtime-cu12==12.8.90 \
+  nvidia-cuda-cupti-cu12==12.8.90 \
+  nvidia-cudnn-cu12==9.10.2.21 \
+  nvidia-cublas-cu12==12.8.4.1 \
+  nvidia-cufft-cu12==11.3.3.83 \
+  nvidia-curand-cu12==10.3.9.90 \
+  nvidia-cusolver-cu12==11.7.3.90 \
+  nvidia-cusparse-cu12==12.5.8.93 \
+  nvidia-cusparselt-cu12==0.7.1 \
+  nvidia-nccl-cu12==2.27.5 \
+  nvidia-nvshmem-cu12==3.3.20 \
+  nvidia-nvtx-cu12==12.8.90 \
+  nvidia-nvjitlink-cu12==12.8.93 \
+  nvidia-cufile-cu12==1.13.1.3 \
+  triton==3.5.1
+
+$PY -m pip install \
+  -i https://mirrors.aliyun.com/pypi/simple/ \
+  --trusted-host mirrors.aliyun.com \
+  --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  numpy==1.26.4 "matscipy<1.2" ase==3.28.0 mace-torch==0.3.16 \
+  cupy-cuda12x==13.6.0 \
+  cuequivariance==0.10.0 cuequivariance-torch==0.10.0 \
+  cuequivariance-ops-torch-cu12==0.10.0
+\end{lstlisting}
+
+LAMMPS ML-IAP 需要单独源码编译。完成 LAMMPS 安装后，再把 LAMMPS 前缀和 Python 环境加入运行环境：
+
+\begin{lstlisting}[language=bash]
+export MACE_ENV=/root/base/envs/mace-lammps-torch291-cu128
+export LAMMPS_PREFIX=/root/base/software/lammps-mliap-torch291-cu128
+export PATH=$LAMMPS_PREFIX/bin:$MACE_ENV/bin:$PATH
+export LD_LIBRARY_PATH=$LAMMPS_PREFIX/lib:$MACE_ENV/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=$MACE_ENV/lib/python3.12/site-packages
+\end{lstlisting}
+
+\subsection{安装 Python 包}
+
+在开发目录中安装当前包：
+
+\begin{lstlisting}[language=bash]
+cd /root/base/src/lammps-mace
+python -m pip install -e .
+lammps-mace --help
+\end{lstlisting}
+
+从 GitHub 安装时可使用：
+
+\begin{lstlisting}[language=bash]
+python -m pip install git+https://github.com/LiangWenshuo1118/lammps-mace.git
+\end{lstlisting}
+
+项目仓库地址：\url{https://github.com/LiangWenshuo1118/lammps-mace}。
+
+安装后提供的命令名是 \texttt{lammps-mace}，Python import 包名是 \texttt{lammps\_mace}。
+
+\subsection{运行前检查}
+
+建模阶段依赖 ASE 和 Packmol；MD 和微调阶段依赖 MACE、PyTorch、LAMMPS ML-IAP 和已转换好的模型文件。正式运行前建议先检查：
+
+\begin{lstlisting}[language=bash]
+python -c "import ase; print(ase.__version__)"
+packmol -h
+lammps-mace --version
+\end{lstlisting}
+
+如果需要在 LAMMPS 中运行 MACE ML-IAP，还应确认：
+
+\begin{lstlisting}[language=bash]
+LD_LIBRARY_PATH=/path/to/lammps-mliap-install/lib:$LD_LIBRARY_PATH \
+  /path/to/lammps-mliap-install/bin/lmp -h
+
+python -c "import lammps; L=lammps.lammps(cmdargs=['-log','none','-screen','none']); print(L.version()); L.close()"
+\end{lstlisting}
+
+\section{准备项目骨架}
+
+新建一个演示目录：
+
+\begin{lstlisting}[language=bash]
+lammps-mace init --target demo
+cd demo
+\end{lstlisting}
+
+这个命令会创建项目目录，并写出一个示例 CSV。
+
+\subsection{项目目录}
+
+初始化后的目录结构如下：
+
+\begin{lstlisting}
+demo/
+├── examples/systems.csv
+├── outputs/
+├── models/base/
+├── models/finetuned/
+├── data/finetune/
+└── data/dft/
+\end{lstlisting}
+
+\begin{itemize}
+  \item \path{examples/systems.csv} 是示例体系表，也是构盒阶段最小输入文件。
+  \item \path{outputs/} 用于存放构盒结果、LAMMPS 输入、运行脚本、轨迹、日志和训练任务输出。
+  \item \path{models/base/} 用于存放基础 MACE 模型，例如 \texttt{mace-mp-0b3-medium.model} 及其 ML-IAP 转换文件。
+  \item \path{models/finetuned/} 用于集中存放希望长期保留或复用的微调模型。
+  \item \path{data/dft/} 用于存放 DFT 任务数据、原始计算结果或后续数据处理所需的中间文件。
+  \item \path{data/finetune/} 用于存放从 DFT 数据中提取并整理好的 MACE 微调数据，例如训练集 \texttt{Training.extxyz} 和验证集 \texttt{Validation.extxyz}。
+\end{itemize}
+
+\subsection{CSV 输入格式}
+
+CSV 是唯一的初始体系输入文件。\texttt{system.json} 和 \texttt{md\_settings.json} 两个文件是工作流生成的中间元数据。
+
+\begin{longtable}{@{}>{\ttfamily\small\raggedright\arraybackslash}p{0.30\linewidth}>{\raggedright\arraybackslash}p{0.18\linewidth}>{\raggedright\arraybackslash}p{0.46\linewidth}@{}}
+\toprule
+\normalfont 字段 & 示例 & 说明 \\
+\midrule
+\endhead
+system\_index & 001 & 体系编号，用于输出目录命名。 \\
+salts & LiCl-KCl-AlF3 & 盐公式，多个盐用短横线、逗号或分号分隔。 \\
+concentrations & 50-45-5 & 与 \texttt{salts} 一一对应的浓度。 \\
+concentration\_type & mol\% & 支持 \texttt{mol\%} 或 \texttt{wt\%}。 \\
+total\_atoms & 128 & 目标原子数。实际原子数会因整数 formula unit 近似略有调整。 \\
+\bottomrule
+\end{longtable}
+
+\section{批量构建模拟盒子}
+
+\subsection{执行构盒}
+
+从 CSV 构建所有体系：
+
+\begin{lstlisting}[language=bash]
+lammps-mace build-boxes \
+  --csv examples/systems.csv \
+  --output-root outputs \
+  --density 1.46
+\end{lstlisting}
+
+\texttt{--packmol-tolerance} 为可选参数，默认值为 \texttt{2.0}。
+
+命令会读取每一行体系定义，计算盐的 formula unit 数、元素原子数和盒长，然后调用 Packmol 随机填充盒子，最后用 ASE 转出 LAMMPS data 文件。
+
+\subsection{构盒输出}
+
+每一行 CSV 对应一个输出目录，例如：
+
+\begin{lstlisting}
+outputs/001_LiCl/
+└── simulation_box/
+    ├── ions/
+    │   ├── Li.pdb
+    │   └── Cl.pdb
+    ├── packmol.inp
+    ├── packmol.log
+    ├── box.pdb
+    ├── box.data
+    └── system.json
+\end{lstlisting}
+
+其中：
+
+\begin{itemize}
+  \item \texttt{simulation\_box/box.data} 是后续 LAMMPS 输入读取的结构文件。
+  \item \texttt{simulation\_box/system.json} 记录归一化后的组成、密度、元素计数和盒长。
+  \item \texttt{simulation\_box/packmol.log} 用来排查 Packmol 是否成功收敛。
+\end{itemize}
+
+\section{生成零样本 MACE-MD 输入}
+
+\subsection{准备基础模型}
+
+基础 MACE-MP checkpoint 建议放在：
+
+\begin{lstlisting}
+models/base/mace-mp-0b3-medium.model
+\end{lstlisting}
+
+LAMMPS ML-IAP 不能直接读取 \texttt{.model}，需要先转换为 \texttt{*-mliap\_lammps.pt}：
+
+\begin{lstlisting}[language=bash]
+python -m mace.cli.create_lammps_model \
+  models/base/mace-mp-0b3-medium.model \
+  --format=mliap
+\end{lstlisting}
+
+转换后通常得到：
+
+\begin{lstlisting}
+models/base/mace-mp-0b3-medium.model-mliap_lammps.pt
+\end{lstlisting}
+
+\subsection{生成并提交 LAMMPS 任务}
+
+第一步先生成 NPT 任务。NPT 用来在指定温度和压力下弛豫体系：
+
+\begin{lstlisting}[language=bash]
+lammps-mace mace-md-npt \
+  --boxes-root outputs \
+  --model-path models/base/mace-mp-0b3-medium.model-mliap_lammps.pt \
+  --temperature 973 1073 \
+  --pressure 0 1 \
+  --npt-steps 1000 \
+  --timestep-fs 1.0 \
+  --thermo-every 100 \
+  --dump-every 100
+\end{lstlisting}
+
+\texttt{--temperature} 和 \texttt{--pressure} 都支持多个值。NPT 会为二者的笛卡尔积
+创建条件目录，例如 \texttt{973K\_00bar}、\texttt{973K\_01bar} 和 \texttt{1073K\_00bar}。
+
+NPT 任务输出结构如下：
+
+\begin{lstlisting}
+outputs/001_LiCl/
+├── simulation_box/
+│   └── box.data
+└── 973K_00bar/
+    └── mace-md-npt/
+        ├── in.lammps
+        ├── md_settings.json
+        └── run.sh
+\end{lstlisting}
+
+同时会在 \texttt{outputs/} 下生成 NPT 总脚本：
+
+\begin{lstlisting}
+outputs/run_mace_md_npt_all.sh
+\end{lstlisting}
+
+提交全部 NPT 任务：
+
+\begin{lstlisting}[language=bash]
+bash outputs/run_mace_md_npt_all.sh
+\end{lstlisting}
+
+NPT 总脚本会按体系目录和条件目录顺序调用每个 \texttt{mace-md-npt/run.sh}。任务成功结束后，会在对应目录写入空文件 \texttt{task\_finished}；如果任务中断，重新执行总脚本时，已有
+\texttt{task\_finished} 的目录会自动跳过。
+
+第二步再生成 NVT 任务。NVT 会跟随已有的 NPT 条件目录生成输入。默认 NVT 读取初始构盒结构，因此不依赖 NPT 是否已经完成：
+
+\begin{lstlisting}[language=bash]
+lammps-mace mace-md-nvt \
+  --boxes-root outputs \
+  --model-path models/base/mace-mp-0b3-medium.model-mliap_lammps.pt \
+  --nvt-steps 1000 \
+  --timestep-fs 1.0 \
+  --thermo-every 100 \
+  --dump-every 100
+\end{lstlisting}
+
+如果只想为部分温度生成 NVT，可在 NVT 命令中加入 \texttt{--temperature}，后面填写需要保留的温度值，例如只生成 973 K 条件对应的 NVT 输入。
+
+如果希望 NVT 盒子使用 NPT 后段平均密度，可在 NVT 命令中加入 \texttt{--use-npt-density}，后面填写用于平均的 NPT 后段比例，例如 \texttt{0.8} 表示使用最后 80\% 的密度样本。
+
+使用 \texttt{--use-npt-density} 时，需要对应条件目录下的 NPT 已经运行完成，并存在下面两个文件：
+
+\begin{lstlisting}
+mace-md-npt/final_mace_npt.data
+mace-md-npt/log.kk.half.lammps
+\end{lstlisting}
+
+NVT 任务输出结构如下：
+
+\begin{lstlisting}
+outputs/001_LiCl/
+├── simulation_box/
+│   └── box.data
+└── 973K_00bar/
+    └── mace-md-nvt/
+        ├── in.lammps
+        ├── md_settings.json
+        └── run.sh
+\end{lstlisting}
+
+同时会在 \texttt{outputs/} 下生成 NVT 总脚本：
+
+\begin{lstlisting}
+outputs/run_mace_md_nvt_all.sh
+\end{lstlisting}
+
+提交全部 NVT 任务：
+
+\begin{lstlisting}[language=bash]
+bash outputs/run_mace_md_nvt_all.sh
+\end{lstlisting}
+
+NVT 总脚本会按已有 NPT 条件目录顺序调用每个\texttt{mace-md-nvt/run.sh}。NVT 任务同样使用 \texttt{task\_finished}记录完成状态，重新提交时会自动跳过已完成目录。可用下面命令统一监控 NPT 和 NVT 进度：
+
+\begin{lstlisting}[language=bash]
+find outputs -name task_finished -print | sort
+\end{lstlisting}
+
+\subsection{单任务调试 LAMMPS}
+
+远端实测推荐使用上一节生成的总脚本顺序执行全部任务。单任务调试时，也可手动使用 KOKKOS ML-IAP 路径，并显式启用 half neighbor list：
+
+\begin{lstlisting}[language=bash]
+export MACE_ENV=/root/base/envs/mace-lammps-torch291-cu128
+export LAMMPS_PREFIX=/root/base/software/lammps-mliap-torch291-cu128
+export PATH=$LAMMPS_PREFIX/bin:$MACE_ENV/bin:$PATH
+export LD_LIBRARY_PATH=$LAMMPS_PREFIX/lib:$MACE_ENV/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=$MACE_ENV/lib/python3.12/site-packages
+export OMPI_MCA_mtl=^ofi
+export OMPI_MCA_pml=ob1
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+
+cd outputs/001_LiCl/973K_00bar/mace-md-nvt
+$LAMMPS_PREFIX/bin/lmp \
+  -k on g 1 -sf kk -pk kokkos neigh half \
+  -in in.lammps -log log.kk.half.lammps
+\end{lstlisting}
+
+日志中出现 \texttt{Loop time} 通常表示 smoke 运行完成。
+
+\section{准备 MACE 微调任务}
+
+MACE 官方文档推荐，正式迁移 foundation model 时优先考虑 multihead replay fine-tuning，以降低遗忘风险；这需要额外准备 replay/pretraining 数据，例如 \texttt{--pt\_train\_file}。本教程先采用官方 naive fine-tuning 示例作为通用起点：关闭 multihead、使用 \texttt{E0s=average}、较小学习率、EMA、AMSGrad 和 \texttt{float64}。参考：\href{https://mace-docs.readthedocs.io/en/latest/guide/finetuning.html}{MACE fine-tuning 文档}。
+
+本章示例使用的微调数据来自 SuperSalt，放在 \texttt{data/finetune/} 目录下，训练集和验证集分别命名为 \texttt{Training.extxyz} 和 \texttt{Validation.extxyz}。如果后续替换为自己的 DFT 数据，只需要保持相同的 extxyz 文件格式，并在命令中调整文件名即可。
+
+使用下面这一组命令准备微调任务目录：
+
+\begin{lstlisting}[language=bash]
+lammps-mace finetune \
+  --task-dir outputs/finetune-mace \
+  --dataset-root data/finetune \
+  --train-file Training.extxyz \
+  --valid-file Validation.extxyz \
+  --foundation-model models/base/mace-mp-0b3-medium.model \
+  --name mace-mp-0b3-medium-finetuned \
+  --max-num-epochs 6 \
+  --batch-size 2 \
+  --forces-key force \
+  --stress-key stress \
+  --stress-weight 1.0 \
+  --e0s average \
+  --energy-weight 1.0 \
+  --forces-weight 1.0 \
+  --lr 0.01 \
+  --scaling rms_forces_scaling \
+  --ema \
+  --ema-decay 0.99 \
+  --amsgrad \
+  --default-dtype float64 \
+  --seed 3 \
+  --no-multiheads-finetuning \
+  --smoke-max-configs 100 \
+  --require-dataset
+\end{lstlisting}
+
+\texttt{--smoke-max-configs} 是可选参数，只用于 smoke 测试。设置后，程序会在任务目录内
+写出裁剪后的 \texttt{smoke-dataset/}，训练脚本会指向这个小数据集，用来快速检查训练链路。
+正式训练时可以删除这个参数。
+
+输出目录：
+
+\begin{lstlisting}
+outputs/finetune-mace/
+├── checkpoints/
+├── logs/
+├── models/
+├── results/
+├── finetune_settings.json
+└── run_train.sh
+\end{lstlisting}
+
+\texttt{run\_train.sh} 中真正执行的是 MACE 的 \texttt{mace\_run\_train} 命令。
+其中核心内容类似下面这样：
+
+\begin{lstlisting}[language=bash]
+cd "$(dirname "$0")"
+exec mace_run_train \
+  --name mace-mp-0b3-medium-finetuned \
+  --foundation_model /root/demo/models/base/mace-mp-0b3-medium.model \
+  --train_file /root/demo/outputs/finetune-mace/smoke-dataset/Training.extxyz \
+  --valid_file /root/demo/outputs/finetune-mace/smoke-dataset/Validation.extxyz \
+  --results_dir /root/demo/outputs/finetune-mace/results \
+  --work_dir /root/demo/outputs/finetune-mace \
+  --log_dir /root/demo/outputs/finetune-mace/logs \
+  --model_dir /root/demo/outputs/finetune-mace/models \
+  --checkpoints_dir /root/demo/outputs/finetune-mace/checkpoints \
+  --E0s average \
+  --valid_batch_size 2 \
+  --device cuda \
+  --max_num_epochs 6 \
+  --batch_size 2 \
+  --energy_key energy \
+  --forces_key force \
+  --stress_key stress \
+  --energy_weight 1.0 \
+  --forces_weight 1.0 \
+  --stress_weight 1.0 \
+  --lr 0.01 \
+  --scaling rms_forces_scaling \
+  --default_dtype float64 \
+  --seed 3 \
+  --multiheads_finetuning False \
+  --ema \
+  --ema_decay 0.99 \
+  --amsgrad
+\end{lstlisting}
+
+提交训练任务：
+
+\begin{lstlisting}[language=bash]
+cd outputs/finetune-mace
+nohup bash run_train.sh > nohup.out 2>&1 &
+\end{lstlisting}
+
+\section{使用微调模型生成 MD 输入}
+
+第 6 章提交训练任务时已经进入 \texttt{outputs/finetune-mace} 目录。训练完成后，先回到项目根目录：
+
+\begin{lstlisting}[language=bash]
+cd ../..
+\end{lstlisting}
+
+第 6 章示例中 \texttt{--name} 设置为
+\texttt{mace-mp-0b3-medium-finetuned}。训练完成后，模型通常位于
+\texttt{outputs/finetune-mace/models/mace-mp-0b3-medium-finetuned.model}。
+先把这个 \texttt{.model} 转成 ML-IAP 格式：
+
+\begin{lstlisting}[language=bash]
+python -m mace.cli.create_lammps_model \
+  outputs/finetune-mace/models/mace-mp-0b3-medium-finetuned.model \
+  --format=mliap
+\end{lstlisting}
+
+需要注意的是，按照本文的微调流程导出的模型不一定继续保留基础 MACE-MP 的全部元素覆盖范围。微调后的模型通常会以微调数据覆盖的元素表为准，因此模型文件可能明显变小，但适用体系也会变窄。SuperSalt数据集为例，微调模型只支持 \texttt{Li, Na, Mg, Cl, K, Ca, Zn, Rb, Sr, Zr, Cs, Ba}。如果后续体系包含微调模型不支持的元素，例如 \texttt{Al} 或 \texttt{F}，LAMMPS 会在 \texttt{pair\_coeff} 阶段报错。实际使用前应确认\texttt{simulation\_box/system.json} 里的元素都在微调模型支持范围内。
+
+再生成微调模型输入。命令仍然使用 NPT/NVT 两个子命令，只需要把\texttt{--model-path} 指向新的 ML-IAP 模型。为避免覆盖第 5 章基础模型的 \texttt{mace-md-npt} 和 \texttt{mace-md-nvt} 目录，这里加上 \texttt{--task-suffix finetuned}。先生成并提交微调模型 NPT 任务：
+
+\begin{lstlisting}[language=bash]
+lammps-mace mace-md-npt \
+  --boxes-root outputs \
+  --model-path outputs/finetune-mace/models/mace-mp-0b3-medium-finetuned.model-mliap_lammps.pt \
+  --task-suffix finetuned \
+  --temperature 973 \
+  --pressure 0 \
+  --npt-steps 100 \
+  --timestep-fs 1.0 \
+  --thermo-every 10
+
+bash outputs/run_mace_md_npt_finetuned_all.sh
+\end{lstlisting}
+
+等待 NPT 完成后，再生成并提交 NVT 任务。这里使用 \texttt{--use-npt-density 0.8}，表示用 NPT 最后 80\% 的密度平均值确定 NVT 盒子尺寸：
+
+\begin{lstlisting}[language=bash]
+lammps-mace mace-md-nvt \
+  --boxes-root outputs \
+  --model-path outputs/finetune-mace/models/mace-mp-0b3-medium-finetuned.model-mliap_lammps.pt \
+  --task-suffix finetuned \
+  --nvt-steps 100 \
+  --timestep-fs 1.0 \
+  --thermo-every 10 \
+  --use-npt-density 0.8
+
+bash outputs/run_mace_md_nvt_finetuned_all.sh
+\end{lstlisting}
+
+输出结构与基础模型相同：
+
+\begin{lstlisting}
+outputs/001_LiCl/973K_00bar/
+├── mace-md-npt-finetuned/in.lammps
+└── mace-md-nvt-finetuned/in.lammps
+\end{lstlisting}
+
+运行方式与基础模型 MACE-MD 相同。总脚本为：
+
+\begin{lstlisting}
+outputs/run_mace_md_npt_finetuned_all.sh
+outputs/run_mace_md_nvt_finetuned_all.sh
+\end{lstlisting}
+
+\section{命令速查}
+
+本章按 \texttt{lammps-mace} 的二级命令整理常用写法。每个命令默认从项目根目录执行，
+除非正文特别说明已经切换到某个任务目录。
+
+\begin{longtable}{@{}>{\ttfamily\small\raggedright\arraybackslash}p{0.30\linewidth}>{\raggedright\arraybackslash}p{0.64\linewidth}@{}}
+\toprule
+\normalfont 一级子命令 & 功能 \\
+\midrule
+\endhead
+init & 创建项目骨架、示例 CSV 和常用目录。 \\
+build-boxes & 根据 CSV 批量构建模拟盒子，并把 Packmol 结果写入各体系的 \texttt{simulation\_box/}。 \\
+mace-md-npt & 根据已有盒子和 ML-IAP 模型生成 NPT LAMMPS 输入、单任务运行脚本和总提交脚本。 \\
+mace-md-nvt & 根据已有 NPT 条件目录生成 NVT 输入；可选择继续使用初始盒子，或用 NPT 后段平均密度确定盒长。 \\
+finetune & 创建 MACE 微调任务目录，写出 \texttt{run\_train.sh} 和精简的 \texttt{finetune\_settings.json}。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{\texttt{lammps-mace init}}
+
+\begin{longtable}{@{}>{\ttfamily\small\raggedright\arraybackslash}p{0.18\linewidth}>{\ttfamily\small\raggedright\arraybackslash}p{0.15\linewidth}>{\raggedright\arraybackslash}p{0.61\linewidth}@{}}
+\toprule
+\normalfont 二级子命令 & \normalfont 类型 & 功能 \\
+\midrule
+\endhead
+target & str & 必须。目标目录；在其中初始化项目骨架，写入 \path{examples/systems.csv}，并创建 \path{models/}、\path{data/} 和 \path{outputs/} 等常用目录。该命令不构盒、不下载模型，也不启动 LAMMPS。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{\texttt{lammps-mace build-boxes}}
+
+\begin{longtable}{@{}>{\ttfamily\small\raggedright\arraybackslash}p{0.18\linewidth}>{\ttfamily\small\raggedright\arraybackslash}p{0.15\linewidth}>{\raggedright\arraybackslash}p{0.61\linewidth}@{}}
+\toprule
+\normalfont 二级子命令 & \normalfont 类型 & 功能 \\
+\midrule
+\endhead
+csv & str & 必须。体系 CSV；CSV 中的组成用于构盒，MD 温度由后续 NPT/NVT 命令指定。 \\
+output-root & str & 可选。体系输出根目录；默认 \path{outputs/}。 \\
+density & float & 必须。初始建模密度，单位为 \texttt{g/cm3}。 \\
+packmol-\allowbreak{}tolerance & float & 可选。Packmol 最小原子间距；默认 \texttt{2.0}。 \\
+packmol-bin & str & 可选。Packmol 可执行文件名称或路径；默认 \texttt{packmol}。 \\
+seed & int & 可选。Packmol 随机种子，用于复现初始构型；默认 \texttt{973}。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{\texttt{lammps-mace mace-md-npt}}
+
+\begin{longtable}{@{}>{\ttfamily\small\raggedright\arraybackslash}p{0.18\linewidth}>{\ttfamily\small\raggedright\arraybackslash}p{0.15\linewidth}>{\raggedright\arraybackslash}p{0.61\linewidth}@{}}
+\toprule
+\normalfont 二级子命令 & \normalfont 类型 & 功能 \\
+\midrule
+\endhead
+boxes-root & str & 可选。已完成构盒的体系根目录；默认 \path{outputs/}，该目录下应包含各体系的 \path{simulation_box/}。 \\
+model-path & str & 可选。已转换好的 ML-IAP 模型文件；默认 \path{models/base/mace-mp-0b3-medium.model-mliap_lammps.pt}。 \\
+temperature & list[float] & 必须。NPT 温度；支持一次给多个温度。 \\
+pressure & list[float] & 必须。NPT 压力；支持一次给多个压力。 \\
+task-suffix & str & 可选。任务目录和总脚本后缀；默认无后缀，例如 \texttt{finetuned} 会生成 \path{mace-md-npt-finetuned/}。 \\
+npt-steps & int & 可选。NPT 步数；默认 \texttt{1000}。 \\
+timestep-fs & float & 可选。LAMMPS 时间步，单位为 fs；默认 \texttt{1.0}。 \\
+thermo-every & int & 可选。thermo 输出间隔；默认 \texttt{100}。 \\
+dump-every & int & 可选。轨迹 dump 输出间隔；默认 \texttt{100}。 \\
+tdamp-fs & float & 可选。温控阻尼时间，单位为 fs；默认 \texttt{100.0}。 \\
+pdamp-fs & float & 可选。压控阻尼时间，单位为 fs；默认 \texttt{1000.0}。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{\texttt{lammps-mace mace-md-nvt}}
+
+\begin{longtable}{@{}>{\ttfamily\small\raggedright\arraybackslash}p{0.18\linewidth}>{\ttfamily\small\raggedright\arraybackslash}p{0.15\linewidth}>{\raggedright\arraybackslash}p{0.61\linewidth}@{}}
+\toprule
+\normalfont 二级子命令 & \normalfont 类型 & 功能 \\
+\midrule
+\endhead
+boxes-root & str & 可选。体系根目录；默认 \path{outputs/}，程序从已有 NPT 条件目录判断需要生成哪些 NVT 任务。 \\
+model-path & str & 可选。NVT 使用的 ML-IAP 模型；默认 \path{models/base/mace-mp-0b3-medium.model-mliap_lammps.pt}。使用微调模型时必须显式指定。 \\
+temperature & list[float] & 可选。温度过滤；默认处理所有已有 NPT 条件，设置后只处理指定温度。 \\
+use-\allowbreak{}npt-\allowbreak{}density & float & 可选。NVT 密度来源；默认使用 \path{simulation_box/box.data}，例如 \texttt{0.8} 表示使用 NPT 最后 80\% 的密度平均值确定 NVT 盒长。 \\
+task-suffix & str & 可选。任务后缀；默认无后缀，例如 \texttt{finetuned} 只查找 \path{mace-md-npt-finetuned/}，并生成 \path{mace-md-nvt-finetuned/}。 \\
+nvt-steps & int & 可选。NVT 步数；默认 \texttt{1000}。 \\
+timestep-fs & float & 可选。LAMMPS 时间步，单位为 fs；默认 \texttt{1.0}。 \\
+thermo-every & int & 可选。thermo 输出间隔；默认 \texttt{100}。 \\
+dump-every & int & 可选。轨迹 dump 输出间隔；默认 \texttt{100}。 \\
+tdamp-fs & float & 可选。温控阻尼时间，单位为 fs；默认 \texttt{100.0}。 \\
+\bottomrule
+\end{longtable}
+
+\Needspace{12\baselineskip}
+\subsection{\texttt{lammps-mace finetune}}
+
+\begin{longtable}{@{}>{\ttfamily\small\raggedright\arraybackslash}p{0.18\linewidth}>{\ttfamily\small\raggedright\arraybackslash}p{0.15\linewidth}>{\raggedright\arraybackslash}p{0.61\linewidth}@{}}
+\toprule
+\normalfont 二级子命令 & \normalfont 类型 & 功能 \\
+\midrule
+\endhead
+task-dir & str & 可选。微调任务目录；默认 \path{outputs/finetune-mace/}，程序会在其中写入 \path{run_train.sh}、\path{finetune_settings.json}、日志目录、模型目录和结果目录。 \\
+dataset-root & str & 可选。extxyz 数据目录；默认 \path{data/finetune/}，本教程示例数据来自 SuperSalt。 \\
+train-file & str & 可选。训练集 extxyz 文件名；默认 \texttt{train.extxyz}。 \\
+valid-file & str & 可选。验证集 extxyz 文件名；默认 \texttt{valid.extxyz}。 \\
+test-file & str & 可选。测试集 extxyz 文件名；默认不使用测试集。 \\
+foundation-\allowbreak{}model & str & 可选。未转换的 MACE \texttt{.model} 文件；默认 \path{models/base/mace-mp-0b3-medium.model}。 \\
+name & str & 可选。训练输出模型名称；默认 \texttt{mace-mp-0b3-medium-finetuned}。 \\
+results-dir & str & 可选。MACE 结果目录；默认 \path{<task-dir>/results/}。 \\
+work-dir & str & 可选。MACE 工作目录；默认 \path{<task-dir>/}。 \\
+log-dir & str & 可选。训练日志目录；默认 \path{<task-dir>/logs/}。 \\
+model-dir & str & 可选。训练输出模型目录；默认 \path{<task-dir>/models/}。 \\
+checkpoints-\allowbreak{}dir & str & 可选。checkpoint 目录；默认 \path{<task-dir>/checkpoints/}。 \\
+device & str & 可选。训练设备；默认 \texttt{cuda}，也可设为 \texttt{cpu}。 \\
+max-num-epochs & int & 可选。最大训练 epoch 数；默认 \texttt{6}。 \\
+batch-size & int & 可选。训练 batch size；默认 \texttt{2}。 \\
+valid-\allowbreak{}batch-\allowbreak{}size & int & 可选。验证 batch size；默认跟 \texttt{--batch-size} 一致。 \\
+energy-key & str & 可选。extxyz 中能量字段名称；默认 \texttt{energy}。 \\
+forces-key & str & 可选。extxyz 中力字段名称；默认 \texttt{forces}。 \\
+stress-key & str & 可选。extxyz 中应力字段名称；默认不训练应力。 \\
+e0s & str & 可选。原子参考能设置；默认 \texttt{average}。 \\
+energy-weight & float & 可选。能量损失权重；默认 \texttt{1.0}。 \\
+forces-weight & float & 可选。力损失权重；默认 \texttt{1.0}。 \\
+stress-weight & float & 可选。应力损失权重；默认不传入。 \\
+r-max & float & 可选。邻居截断半径；默认不传入，使用 \texttt{mace\_run\_train} 默认值。 \\
+lr & float & 可选。学习率；默认 \texttt{0.01}。 \\
+scaling & str & 可选。数据缩放方式；默认 \texttt{rms\_forces\_scaling}。 \\
+ema & bool & 可选。是否启用 EMA；默认启用。 \\
+ema-decay & float & 可选。EMA decay；默认 \texttt{0.99}。 \\
+amsgrad & bool & 可选。是否启用 AMSGrad；默认启用。 \\
+default-dtype & str & 可选。默认浮点精度；默认 \texttt{float64}。 \\
+seed & int & 可选。随机种子；默认 \texttt{3}。 \\
+multiheads-\allowbreak{}finetuning & bool & 可选。是否启用 multihead fine-tuning；默认关闭。 \\
+smoke-\allowbreak{}max-\allowbreak{}configs & int & 可选。只用于 smoke 测试，生成小数据集；默认不裁剪数据，正式训练时可以删除。 \\
+require-\allowbreak{}dataset & bool & 可选。要求训练/验证 extxyz 文件必须存在；默认不强制，缺文件时只打印 warning。 \\
+\bottomrule
+\end{longtable}
+
+\vfill
+\begin{center}
+\textcolor{lmgreen}{\textsf{教程结束。建议把本 PDF 与当前代码版本一起归档，方便复现实验环境。}}
+\end{center}
+
+\end{document}

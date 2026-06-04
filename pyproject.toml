@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lammps-mace"
+version = "0.1.0"
+description = "Staged CLI for MACE-MP and LAMMPS ML-IAP molten-salt setup, MD input generation, and MACE fine-tuning task preparation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "ase>=3.28,<4"
+]
+authors = [
+  { name = "lammps-mace contributors" }
+]
+keywords = ["mace", "lammps", "ml-iap", "molecular-dynamics", "molten-salts"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics"
+]
+
+[project.urls]
+Homepage = "https://github.com/LiangWenshuo1118/lammps-mace"
+Repository = "https://github.com/LiangWenshuo1118/lammps-mace"
+
+[project.scripts]
+lammps-mace = "lammps_mace.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

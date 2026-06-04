@@ -1,0 +1,46 @@
+.DS_Store
+AGENTS.md
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Historical local archive
+bakup/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local workflow outputs
+data/
+models/
+runs/
+ht-runs/
+outputs/*
+!outputs/README.md
+logs/
+*.log
+report/data/
+report/figures/
+structures/
+
+# Large or generated data
+examples/models/
+examples/SuperSalt/
+supersalt-dataset/
+*.xyz
+*.extxyz
+*.traj
+*.lammpstrj
+*.dump
+
+# Model artifacts
+*.pt
+*.pth
+*.model
+*.ckpt
